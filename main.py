@@ -138,7 +138,7 @@ all_data = []
 all_labels = []
 import gensim.downloader as api
 
-wv = api.load("word2vec-google-news-300")
+wv = KeyedVectors.load("word2vec-google-news-300.bin")
 for subdir in glob.glob(os.path.join('output2_pruning_ffmq', '*')):
     subdir_name = os.path.basename(subdir)
     edges_data, nodes_data = load_data_from_directory(subdir)
