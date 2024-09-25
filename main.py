@@ -56,7 +56,7 @@ def load_data_from_directory(directory):
         return edges_data, nodes_data
     except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError) as e:
         print(f"Error: {e}")
-        return None, None 
+        return None, None
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         return None, None
@@ -77,14 +77,14 @@ def get_node_embeddings(nodes_data, wv):
             except KeyError:
                 embedding = np.zeros(300)
             code_embedding += embedding
-        
+
         if len(tokens) > 0:
             code_embedding /= len(tokens)
-        
+
         type_embedding = np.zeros(len(node_type_map))
         if node_type in node_type_map:
             type_embedding[node_type_map[node_type] - 1] = 1
-        
+
         full_embedding = np.concatenate([code_embedding, type_embedding])
         node_embeddings[node_key] = full_embedding
     return node_embeddings
@@ -136,10 +136,12 @@ def prepare_data_for_gcn(node_embeddings, edge_index, edge_type_tensor, labels):
     return data
 all_data = []
 all_labels = []
+count=0
+print(count)
 import gensim.downloader as api
-
-wv = KeyedVectors.load("word2vec-google-news-300.bin")
+wv = api.load("word2vec-google-news-300")
 for subdir in glob.glob(os.path.join('output2_pruning_ffmq', '*')):
+    count+=1
     subdir_name = os.path.basename(subdir)
     edges_data, nodes_data = load_data_from_directory(subdir)
     if edges_data is None or nodes_data is None:
@@ -148,11 +150,13 @@ for subdir in glob.glob(os.path.join('output2_pruning_ffmq', '*')):
         continue
     node_embeddings = get_node_embeddings(nodes_data, wv)
     edges_by_node, edge_types = create_grouped_edges(edges_data)
-    edge_index, edge_type_tensor = create_edge_index(edges_by_node, edge_types)   
+    edge_index, edge_type_tensor = create_edge_index(edges_by_node, edge_types)
     label = int(subdir_name.split('_')[-1][0])
     data = prepare_data_for_gcn(node_embeddings, edge_index, edge_type_tensor, [label])
     all_labels.append(label)
     all_data.append(data)
+    if count%1000==0:
+        print(count)
 
 from sklearn.model_selection import train_test_split
 import torch
@@ -160,22 +164,22 @@ from torch_geometric.data import DataLoader
 
 def stratified_split_3way(data_list, y_labels, train_size=0.8, valid_size=0.1, test_size=0.1):
     train_indices, rest_indices = train_test_split(
-        range(len(data_list)), 
-        train_size=train_size, 
+        range(len(data_list)),
+        train_size=train_size,
         stratify=y_labels
     )
-    
-    valid_size_adjusted = valid_size / (valid_size + test_size)  
+
+    valid_size_adjusted = valid_size / (valid_size + test_size)
     valid_indices, test_indices = train_test_split(
         rest_indices,
         test_size=1 - valid_size_adjusted,
-        stratify=[y_labels[i] for i in rest_indices]  
+        stratify=[y_labels[i] for i in rest_indices]
     )
-    
+
     train_data = [data_list[i] for i in train_indices]
     valid_data = [data_list[i] for i in valid_indices]
     test_data = [data_list[i] for i in test_indices]
-    
+
     return train_data, valid_data, test_data
 
 train_data, valid_data, test_data = stratified_split_3way(all_data, all_labels)
@@ -193,98 +197,105 @@ print(f'Number of testing batches: {len(test_loader)}')
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import GatedGraphConv, global_mean_pool
-from torch_geometric.data import DataLoader
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import torch.nn as nn
-from dgl.nn import GatedGraphConv
-import dgl
-from tqdm import tqdm  
-
+from torch_geometric.data import DataLoader
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import os
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-class GGNN(nn.Module):
-    def __init__(self, input_dim, output_dim, max_edge_types, read_out='mean', num_steps=8):
-        super(GGNN, self).__init__()
-        self.read_out = read_out
-        self.inp_dim = input_dim
-        self.out_dim = output_dim
+class GGNNWithEdgeTypes(torch.nn.Module):
+    def __init__(self, input_dim, output_dim, max_edge_types, num_steps=8, readout='mean'):
+        super(GGNNWithEdgeTypes, self).__init__()
+        self.num_steps = num_steps
+        self.readout = readout
         self.max_edge_types = max_edge_types
-        self.num_timesteps = num_steps
         self.linear = nn.Linear(input_dim, output_dim)
+        self.ggcn_layers = nn.ModuleList([
+            GatedGraphConv(out_channels=output_dim, num_layers=num_steps)
+            for _ in range(max_edge_types)
+        ])
         self.dropout = nn.Dropout(0.5)
-        self.ggcn = GatedGraphConv(in_feats=output_dim, out_feats=output_dim, n_steps=num_steps,
-                                   n_etypes=max_edge_types)
-        self.classifier = nn.Linear(in_features=output_dim, out_features=2)
+        self.classifier = nn.Linear(output_dim, 2)
 
     def forward(self, data):
-        edge_index = data.edge_index
-        edge_attr = data.edge_attr.long()
-        g = dgl.graph((edge_index[0], edge_index[1]))
-        num_nodes = g.num_nodes()
-        node_features = data.x
-        num_features = node_features.shape[0]
-        if num_features < num_nodes:
-            padding = torch.zeros((num_nodes - num_features, node_features.shape[1]), dtype=node_features.dtype)
-            node_features = torch.cat([node_features, padding], dim=0)
-        elif num_features > num_nodes:
-            node_features = node_features[:num_nodes]
-        node_features = self.dropout(self.linear(node_features))
-        out = self.ggcn(g, node_features, edge_attr)
-        out = self.dropout(out)  
-        g.ndata['h'] = out        
-        if self.read_out == 'sum':
-            feats = dgl.sum_nodes(g, 'h')
-        elif self.read_out == 'mean':
-            feats = dgl.mean_nodes(g, 'h')
-        result = self.classifier(feats)
-        return result
-
-num_classes = 2  
-model = GGNN(input_dim=369, output_dim=369, max_edge_types=13)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-criterion = torch.nn.CrossEntropyLoss()  
-
-def train(num_epochs, train_loader, test_loader):
+        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+        x = self.linear(x)
+        x = self.dropout(x)
+        valid_mask = (edge_index[0] < x.size(0)) & (edge_index[1] < x.size(0))
+        edge_index = edge_index[:, valid_mask]
+        if edge_index.numel() == 0:
+            return torch.zeros((x.size(0), 2)).to(x.device)
+        assert edge_index.max() < x.size(0), f"Invalid index {edge_index.max()} for {x.size(0)} nodes."
+        messages = torch.zeros_like(x).to(x.device)
+        for edge_type in range(self.max_edge_types):
+            mask = (edge_attr == edge_type).nonzero(as_tuple=True)[0]
+            if len(mask) > 0 and mask.max() < edge_index.size(1):
+                edge_index_type = edge_index[:, mask]
+                messages_type = self.ggcn_layers[edge_type](x, edge_index_type)
+                messages += messages_type
+        out = global_mean_pool(messages, data.batch)
+        out = self.classifier(out)
+        return out
+input_dim = 369
+output_dim = 128
+max_edge_types = 13
+num_classes = 2
+num_steps = 8
+model = GGNNWithEdgeTypes(input_dim=input_dim, output_dim=output_dim, max_edge_types=max_edge_types).to(device)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+class_weights = torch.tensor([0.5, 0.5], dtype=torch.float32).to(device)  # Adjust based on class distribution
+criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+def train(num_epochs, train_loader, valid_loader):
+    model.train()
     for epoch in range(1, num_epochs + 1):
-        model.train()
         epoch_loss = 0.0
-        
+        correct_train = 0
+        total_train = 0
         with tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{num_epochs}", unit='batch') as pbar:
             for data in train_loader:
                 optimizer.zero_grad()
-                out = model(data)  
-                loss = criterion(out, data.y) 
+                out = model(data)
+                # Debug the shape of model output and labels
+#                 print(f"Model output shape: {out.shape}")
+#                 print(f"Labels shape: {data.y.shape}")
+                # Check if batch sizes match
+                if out.size(0) != data.y.size(0):
+#                     print(f"Skipping batch due to mismatched sizes: {out.size(0)} vs {data.y.size(0)}")
+                    continue
+                _, predicted = torch.max(out, 1)
+                correct_train += (predicted == data.y).sum().item()
+                total_train += data.y.size(0)
+                loss = criterion(out, data.y.to(device))
                 loss.backward()
                 optimizer.step()
-
                 epoch_loss += loss.item()
-                pbar.set_postfix(loss=epoch_loss / (pbar.n + 1)) 
-                pbar.update()  
-        
-        print(f"Epoch {epoch}/{num_epochs} - Loss: {epoch_loss:.4f}")
-        
+                pbar.set_postfix(loss=epoch_loss / (pbar.n + 1))
+                pbar.update()
+        train_accuracy = correct_train / total_train
+        print(f"Epoch {epoch}/{num_epochs} - Loss: {epoch_loss:.4f}, Training Accuracy: {train_accuracy:.4f}")
         test(valid_loader)
 
 def test(test_loader):
     model.eval()
     all_preds = []
     all_labels = []
-    
     with torch.no_grad():
         for data in test_loader:
+            data = data.to(device)
             out = model(data)
-            predicted_labels = torch.argmax(out, dim=1)  
-            all_preds.extend(predicted_labels.cpu().numpy()) 
-            all_labels.extend(data.y.cpu().numpy())  
-    
+            if out.size(0) != data.y.size(0):
+                print(f"Skipping batch due to size mismatch: out size {out.size(0)}, label size {data.y.size(0)}")
+                continue
+            predicted_labels = torch.argmax(out, dim=1)
+            all_preds.extend(predicted_labels.cpu().numpy())
+            all_labels.extend(data.y.cpu().numpy())
     accuracy = accuracy_score(all_labels, all_preds)
     precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
     recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
     f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
-    
     print(f"Test Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1-Score: {f1:.4f}")
-    
 
 num_epochs = 100
 train(num_epochs, train_loader, test_loader)
 test(test_loader)
+
