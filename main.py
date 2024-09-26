@@ -245,36 +245,67 @@ model = GGNNWithEdgeTypes(input_dim=input_dim, output_dim=output_dim, max_edge_t
 optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 class_weights = torch.tensor([0.5, 0.5], dtype=torch.float32).to(device)  # Adjust based on class distribution
 criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+
+def calculate_metrics_manual(true_labels, pred_labels):
+    true_labels = np.array(true_labels)
+    pred_labels = np.array(pred_labels)
+    unique_labels = np.unique(true_labels)
+    total_true_positive = 0
+    total_false_positive = 0
+    total_false_negative = 0
+    total_samples = len(true_labels)
+    for label in unique_labels:
+        true_positive = np.sum((true_labels == label) & (pred_labels == label))
+        false_positive = np.sum((true_labels != label) & (pred_labels == label))
+        false_negative = np.sum((true_labels == label) & (pred_labels != label))
+        total_true_positive += true_positive
+        total_false_positive += false_positive
+        total_false_negative += false_negative
+    accuracy = np.sum(true_labels == pred_labels) / total_samples
+    precision = total_true_positive / (total_true_positive + total_false_positive) if (total_true_positive + total_false_positive) > 0 else 0
+    recall = total_true_positive / (total_true_positive + total_false_negative) if (total_true_positive + total_false_negative) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1
+    }
+
 def train(num_epochs, train_loader, valid_loader):
-    model.train()
+    model.train() 
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
         correct_train = 0
         total_train = 0
+        all_preds = []
+        all_labels = []
         with tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{num_epochs}", unit='batch') as pbar:
             for data in train_loader:
+                data = data.to(device)
                 optimizer.zero_grad()
                 out = model(data)
-                # Debug the shape of model output and labels
-#                 print(f"Model output shape: {out.shape}")
-#                 print(f"Labels shape: {data.y.shape}")
-                # Check if batch sizes match
                 if out.size(0) != data.y.size(0):
-#                     print(f"Skipping batch due to mismatched sizes: {out.size(0)} vs {data.y.size(0)}")
                     continue
                 _, predicted = torch.max(out, 1)
                 correct_train += (predicted == data.y).sum().item()
                 total_train += data.y.size(0)
                 loss = criterion(out, data.y.to(device))
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 epoch_loss += loss.item()
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(data.y.cpu().numpy())
                 pbar.set_postfix(loss=epoch_loss / (pbar.n + 1))
                 pbar.update()
-        train_accuracy = correct_train / total_train
-        print(f"Epoch {epoch}/{num_epochs} - Loss: {epoch_loss:.4f}, Training Accuracy: {train_accuracy:.4f}")
+        metrics = calculate_metrics_manual(all_labels, all_preds)
+        print(f"Epoch {epoch}/{num_epochs} - Loss: {epoch_loss / len(train_loader):.4f}, "
+        f"Training Accuracy: {metrics['accuracy']:.4f}, "
+        f"Precision: {metrics['precision']:.4f}, "
+        f"Recall: {metrics['recall']:.4f}, "
+        f"F1-Score: {metrics['f1_score']:.4f}")
         test(valid_loader)
-
 def test(test_loader):
     model.eval()
     all_preds = []
@@ -284,16 +315,15 @@ def test(test_loader):
             data = data.to(device)
             out = model(data)
             if out.size(0) != data.y.size(0):
-                print(f"Skipping batch due to size mismatch: out size {out.size(0)}, label size {data.y.size(0)}")
                 continue
             predicted_labels = torch.argmax(out, dim=1)
             all_preds.extend(predicted_labels.cpu().numpy())
             all_labels.extend(data.y.cpu().numpy())
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
-    recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
-    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
-    print(f"Test Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1-Score: {f1:.4f}")
+    metrics = calculate_metrics_manual(all_labels, all_preds)
+    print(f"Test Accuracy: {metrics['accuracy']:.4f}, "
+          f"Precision: {metrics['precision']:.4f}, "
+          f"Recall: {metrics['recall']:.4f}, "
+          f"F1-Score: {metrics['f1_score']:.4f}")
 
 num_epochs = 100
 train(num_epochs, train_loader, test_loader)
